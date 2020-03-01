@@ -1,7 +1,11 @@
 use clap::{App, Arg};
 use futures::future::join;
 use futures::stream::StreamExt;
+use indexmap::IndexMap;
 use log::{info, trace, warn};
+use rand::Rng;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::collections::{HashMap, HashSet};
 use std::io::Result as IoResult;
 use std::net::Shutdown;
@@ -11,6 +15,8 @@ use tokio::prelude::*;
 use tokio::sync::mpsc;
 
 const BUFFER_SIZE: usize = 4194304;
+const CHANNEL_COUNT: usize = 8;
+const BEGINNING_SEQ: u64 = 5000;
 
 #[derive(Debug)]
 enum ChannelMessage {
@@ -35,6 +41,43 @@ enum ChannelMessage {
 
     NewPeer(TcpStream),
     NewBuddy(TcpStream),
+}
+impl PartialEq for ChannelMessage {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            ChannelMessage::DataFromBuddy(_, seq, _) | ChannelMessage::EofFromBuddy(_, seq) => {
+                match other {
+                    ChannelMessage::DataFromBuddy(_, seq2, _)
+                    | ChannelMessage::EofFromBuddy(_, seq2) => seq2 == seq,
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl Eq for ChannelMessage {}
+
+impl Ord for ChannelMessage {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self {
+            ChannelMessage::DataFromBuddy(_, seq, _) | ChannelMessage::EofFromBuddy(_, seq) => {
+                match other {
+                    ChannelMessage::DataFromBuddy(_, seq2, _)
+                    | ChannelMessage::EofFromBuddy(_, seq2) => seq2.cmp(seq),
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl PartialOrd for ChannelMessage {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl ChannelMessage {
@@ -159,60 +202,100 @@ async fn interfacer(
     let mut to_schd3 = to_schd.clone();
 
     let to_peer_worker = async move {
-        loop {
-            let msg = from_schd.recv().await.expect("mpsc channel error");
+        let mut next_seq = BEGINNING_SEQ;
+        let mut reordering_queue = BinaryHeap::new();
+        'out: loop {
+            let msg_in = from_schd.recv().await.expect("mpsc channel error");
             // TODO reorder msg
 
-            match msg {
-                // write to peer
-                ChannelMessage::DataFromBuddy(_, _, buffer) => {
-                    trace!(
-                        "Interfacer {} received data from buddy for peer, sending",
-                        peer_id
-                    );
-                    // in case of write error, reset peer and inform buddy to reset
-                    if let Err(e) = write_all(&mut to_peer, &buffer).await {
-                        warn!("Write error for peer {}: {:?}", peer_id, e);
-                        if let Err(e) = to_peer.as_ref().shutdown(Shutdown::Both) {
-                            warn!("Failed to shutdown peer {}: {:?}", peer_id, e);
-                        }
-                        tokio::spawn(async move {
-                            to_schd2
-                                .send(ChannelMessage::ResetToBuddy(peer_id))
-                                .await
-                                .expect("failed to communicate with schd");
-                        });
-                        break;
-                    };
-                }
-                // stop writing to peer and quit loop
-                ChannelMessage::EofFromBuddy(_, _) => {
-                    info!(
-                        "Interfacer {} write to peer half close, eof send to peer",
-                        peer_id
-                    );
-                    if let Err(e) = to_peer.as_ref().shutdown(Shutdown::Write) {
-                        warn!("Failed to shutdown peer write {}: {:?}", peer_id, e);
+            let mut msg_w = match msg_in {
+                ChannelMessage::DataFromBuddy(_, seq, _) | ChannelMessage::EofFromBuddy(_, seq) => {
+                    if seq == next_seq {
+                        Some(msg_in)
+                    } else {
+                        reordering_queue.push(msg_in);
+                        None
                     }
-                    break;
                 }
-                // shutdown peer and quit
-                ChannelMessage::ResetFromBuddy(_) => {
-                    info!(
-                        "Interfacer {} write to peer half close, reset send to peer",
-                        peer_id
-                    );
-                    if let Err(e) = to_peer.as_ref().shutdown(Shutdown::Both) {
-                        warn!("Failed to shutdown peer write {}: {:?}", peer_id, e);
-                    }
-                    break;
-                }
-                _ => unreachable!(""),
+                ChannelMessage::ResetFromBuddy(_) => Some(msg_in),
+                _ => unreachable!(),
             };
+
+            loop {
+                let msg = match msg_w {
+                    Some(m) => {
+                        msg_w = None;
+                        m
+                    }
+                    None => match reordering_queue.peek() {
+                        None => break,
+                        Some(m) => match m {
+                            ChannelMessage::DataFromBuddy(_, seq, _)
+                            | ChannelMessage::EofFromBuddy(_, seq) => {
+                                if seq.clone() == next_seq {
+                                    reordering_queue.pop().unwrap()
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ => unreachable!(),
+                        },
+                    },
+                };
+                next_seq += 1;
+
+                match msg {
+                    // write to peer
+                    ChannelMessage::DataFromBuddy(_, _, buffer) => {
+                        trace!(
+                            "Interfacer {} received data from buddy for peer, sending",
+                            peer_id
+                        );
+                        // in case of write error, reset peer and inform buddy to reset
+                        if let Err(e) = write_all(&mut to_peer, &buffer).await {
+                            warn!("Write error for peer {}: {:?}", peer_id, e);
+                            if let Err(e) = to_peer.as_ref().shutdown(Shutdown::Both) {
+                                warn!("Failed to shutdown peer {}: {:?}", peer_id, e);
+                            }
+                            tokio::spawn(async move {
+                                to_schd2
+                                    .send(ChannelMessage::ResetToBuddy(peer_id))
+                                    .await
+                                    .expect("failed to communicate with schd");
+                            });
+                            break 'out;
+                        };
+                    }
+                    // stop writing to peer and quit loop
+                    ChannelMessage::EofFromBuddy(_, _) => {
+                        info!(
+                            "Interfacer {} write to peer half close, eof send to peer",
+                            peer_id
+                        );
+                        if let Err(e) = to_peer.as_ref().shutdown(Shutdown::Write) {
+                            warn!("Failed to shutdown peer write {}: {:?}", peer_id, e);
+                        }
+                        break 'out;
+                    }
+                    // shutdown peer and quit
+                    ChannelMessage::ResetFromBuddy(_) => {
+                        info!(
+                            "Interfacer {} write to peer half close, reset send to peer",
+                            peer_id
+                        );
+                        if let Err(e) = to_peer.as_ref().shutdown(Shutdown::Both) {
+                            warn!("Failed to shutdown peer write {}: {:?}", peer_id, e);
+                        }
+                        break 'out;
+                    }
+                    _ => unreachable!(""),
+                };
+            }
         }
     };
 
     let from_peer_worker = async move {
+        let mut next_seq = BEGINNING_SEQ;
         loop {
             let mut buffer = vec![0u8; BUFFER_SIZE].into_boxed_slice();
             // read from peer
@@ -237,20 +320,27 @@ async fn interfacer(
                 if let Err(e) = from_peer.as_ref().shutdown(Shutdown::Read) {
                     warn!("Failed to shutdown reader(only) at {} :{:?}", peer_id, e);
                 }
-                if let Err(e) = to_schd.send(ChannelMessage::EofToBuddy(peer_id, 0)).await {
+                if let Err(e) = to_schd
+                    .send(ChannelMessage::EofToBuddy(peer_id, next_seq))
+                    .await
+                {
                     warn!("Failed to send message to muxer at {} :{:?}", peer_id, e);
                 }
+                next_seq += 1;
                 break;
             }
 
             // send data to buddy via muxer
             if let Err(e) = to_schd
-                .send(ChannelMessage::DataToBuddy(peer_id, 0, buffer, bytes))
+                .send(ChannelMessage::DataToBuddy(
+                    peer_id, next_seq, buffer, bytes,
+                ))
                 .await
             {
                 warn!("Failed to send message to muxer at {} :{:?}", peer_id, e);
                 break;
             };
+            next_seq += 1;
         }
     };
 
@@ -338,18 +428,22 @@ async fn server_mode_concierge(listen: &str, mut to_scheduler: mpsc::Sender<Chan
 }
 
 fn select_channel(
-    to_channels: &mut HashMap<u64, mpsc::Sender<ChannelMessage>>,
+    to_channels: &mut IndexMap<u64, mpsc::Sender<ChannelMessage>>,
 ) -> &mut mpsc::Sender<ChannelMessage> {
-    to_channels.get_mut(&0u64).unwrap()
+    let mut rng = rand::thread_rng();
+    let chn = rng.gen_range(0, to_channels.len());
+    to_channels.get_index_mut(chn).unwrap().1
 }
 
 async fn connect_and_select_channel<'a>(
-    to_channels: &'a mut HashMap<u64, mpsc::Sender<ChannelMessage>>,
+    to_channels: &'a mut IndexMap<u64, mpsc::Sender<ChannelMessage>>,
     channel_id: &mut u64,
     server: &str,
     to_schd_template: &mpsc::Sender<ChannelMessage>,
 ) -> &'a mut mpsc::Sender<ChannelMessage> {
-    if to_channels.len() == 0 {
+    let mut rng = rand::thread_rng();
+
+    while to_channels.len() < CHANNEL_COUNT {
         info!("Connecting to buddy {}", server);
         let stream = TcpStream::connect(server)
             .await
@@ -361,7 +455,8 @@ async fn connect_and_select_channel<'a>(
         info!("New channel created, id={}", *channel_id);
         *channel_id += 1;
     }
-    to_channels.get_mut(&0u64).unwrap()
+    let chn = rng.gen_range(0, to_channels.len());
+    to_channels.get_index_mut(chn).unwrap().1
 }
 
 fn select_interfacer(
@@ -406,7 +501,7 @@ async fn scheduler_client(listen_on: &str, server: &str) {
     let concierge = client_mode_concierge(listen_on, to_schd.clone());
     info!("Forwarder client started, server addr: {}", server);
     let scheduler = async move {
-        let mut to_channels = HashMap::new(); // a list of mpsc::Sender to channels
+        let mut to_channels = IndexMap::new(); // a list of mpsc::Sender to channels
         let mut to_interfacers = HashMap::new(); // map peer_id to the mpsc::Sender of the corresponding interfacer
         let mut dead_peer_ids = HashSet::new();
         let mut peer_id = 5000u64;
@@ -472,7 +567,7 @@ async fn scheduler_server(listen_on: &str, target: &str) {
     let concierge = server_mode_concierge(listen_on, to_schd.clone());
     info!("Forwarder server started, targeting {}", target);
     let scheduler = async move {
-        let mut to_channels = HashMap::new(); // a list of mpsc::Sender to channels
+        let mut to_channels = IndexMap::new(); // a list of mpsc::Sender to channels
         let mut to_interfacers = HashMap::new(); // map peer_id to the mpsc::Sender of the corresponding interfacer
         let mut dead_peer_ids = HashSet::new();
         let mut channel_id = 0u64;
@@ -519,7 +614,7 @@ async fn scheduler_server(listen_on: &str, target: &str) {
                     }
                 }
                 ChannelMessage::NewBuddy(tcp) => {
-                    assert_eq!(to_channels.len(), 0);
+                    //assert_eq!(to_channels.len(), 0);
                     info!("New buddy connecting");
                     // spawn new channel
                     let (tx_to_chan, rx_to_chan) = mpsc::channel(1);
